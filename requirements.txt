@@ -1,0 +1,9 @@
+# Biblioteca de Alejandría - dependencias
+PyQt6
+anthropic
+requests
+pypdf
+python-docx
+chromadb
+sentence-transformers
+torch

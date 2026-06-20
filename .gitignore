@@ -1,0 +1,7 @@
+.venv/
+__pycache__/
+*.pyc
+storage/
+config.json
+vendor/ollama/ollama.exe
+vendor/ollama/models/

@@ -1,0 +1,25 @@
+MODO OLLAMA EMBEBIDO (portátil)
+================================
+
+La app funciona de dos formas con Ollama:
+
+1) Si NO hay nada en esta carpeta:
+   La app usa el Ollama instalado en el sistema (lo arranca solo) y guarda los
+   modelos en la ubicación por defecto del usuario.
+
+2) MODO EMBEBIDO (recomendado para distribuir tu app):
+   Copia aquí el binario del servidor de Ollama:
+       vendor/ollama/ollama.exe
+   (lo encuentras en  %LOCALAPPDATA%\Programs\Ollama\ollama.exe  tras instalar Ollama,
+    o descárgalo desde https://ollama.com/download)
+
+   A partir de ese momento la app usará SU PROPIO Ollama y guardará los modelos en:
+       vendor/ollama/models/
+
+   De este modo el usuario solo instala tu app: ella arranca el servidor sola y,
+   la primera vez, descarga el modelo con barra de progreso.
+
+3) CERO DESCARGAS (offline total):
+   Si además copias la carpeta  vendor/ollama/models/  ya con el modelo dentro
+   (cópiala desde la máquina donde lo descargaste), el usuario no descarga nada:
+   funciona al instante y sin internet.
