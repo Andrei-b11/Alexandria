@@ -22,7 +22,7 @@ def main():
         pass
 
     app = QApplication(sys.argv)
-    app.setApplicationName("Biblioteca de Alejandría")
+    app.setApplicationName("Alexandria")
     app.setWindowIcon(QIcon("assets/icono_png.ico"))
     app.setStyleSheet(STYLE)
     
