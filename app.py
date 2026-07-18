@@ -9,8 +9,9 @@ import ctypes
 from PyQt6.QtWidgets import QApplication
 from PyQt6.QtGui import QIcon
 
+from core import config
 from ui.main_window import MainWindow
-from ui.styles import STYLE
+from ui import styles
 
 
 def main():
@@ -24,7 +25,7 @@ def main():
     app = QApplication(sys.argv)
     app.setApplicationName("Alexandria")
     app.setWindowIcon(QIcon("assets/icono_png.ico"))
-    app.setStyleSheet(STYLE)
+    styles.apply_theme(app, config.load_config().get("theme", "dark"))
     
     window = MainWindow()
     window.show()

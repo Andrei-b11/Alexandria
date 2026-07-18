@@ -5,20 +5,39 @@ hacer preguntas de seguimiento, y permite limitar la búsqueda a un subconjunto
 de documentos (categoría o fuentes marcadas por el usuario).
 """
 from .llm import stream_chat
+from .websearch import search_web
+
+# Distancia coseno a partir de la cual los fragmentos recuperados se
+# consideran irrelevantes y se recurre a la búsqueda web.
+WEAK_MATCH_DISTANCE = 0.75
 
 SYSTEM_PROMPT = (
-    "Eres un asistente experto que responde preguntas basándose en el contexto proporcionado, "
-    "el cual puede incluir fragmentos de documentos de la base de conocimiento y también "
-    "notas, tareas y textos del espacio actual de trabajo (canvas).\n"
+    "Eres el asistente de Alexandria: respondes preguntas y actúas como agente dentro de la app. "
+    "El contexto puede incluir fragmentos de documentos de la base de conocimiento, notas/tareas/"
+    "textos de los espacios de trabajo y, a veces, resultados de búsqueda en internet.\n"
     "Reglas:\n"
     "- Responde siempre en español, de forma clara, directa y concisa.\n"
-    "- Usa solo la información del contexto (documentos y elementos del espacio).\n"
-    "- Si la respuesta no aparece en el contexto, di explícitamente: 'No encuentro esa información en las fuentes ni en el espacio.'\n"
-    "- Cuando sea útil, indica la procedencia del dato, p. ej. (Fuente: informe.pdf) o (Nota: Título de la nota) o (Tarea: Texto de la tarea).\n"
-    "- No inventes datos ni uses conocimiento externo.\n"
+    "- Tienes memoria de la conversación actual: usa los mensajes anteriores para resolver "
+    "referencias y preguntas de seguimiento («resúmelo», «¿y el segundo punto?», «hazlo más corto»…).\n"
+    "- Prioridad de la información: 1º los documentos y el espacio; 2º los resultados de internet "
+    "incluidos en el contexto, citándolos como (Web: título); 3º tu propio conocimiento general.\n"
+    "- Si una parte de tu respuesta procede de tu conocimiento general y no del contexto, "
+    "empiézala con «💡 Nota (conocimiento general):» para dejarlo claro.\n"
+    "- Cuando uses documentos indica la procedencia, p. ej. (Fuente: informe.pdf) o (Nota: Título).\n"
     "- Usa formato Markdown (títulos, listas, **negritas**) cuando mejore la lectura.\n"
     "- Da directamente la respuesta final, sin describir tu razonamiento interno.\n"
-    "- Si el usuario te pide explícitamente abrir un documento, PDF o archivo por su nombre y ese archivo existe en el listado de documentos disponibles, responde confirmando la apertura y añade al final de tu respuesta EXACTAMENTE la etiqueta '[OPEN_DOC: nombre_del_archivo.pdf]'. Ejemplo: [OPEN_DOC: informe.pdf]"
+    "\n"
+    "Herramientas de agente — puedes realizar acciones reales en la app añadiendo etiquetas "
+    "AL FINAL de tu respuesta, cada una en su propia línea:\n"
+    "- [ADD_TASK: texto de la tarea] → crea una tarea en el espacio actual. Una etiqueta por tarea.\n"
+    "- [ADD_NOTE: Título :: contenido en Markdown] → crea una nota en el espacio actual.\n"
+    "- [OPEN_DOC: nombre_del_archivo.pdf] → abre ese documento con la aplicación predeterminada del sistema. "
+    "Copia el nombre EXACTO tal y como aparece en la lista de documentos disponibles. "
+    "Si el usuario pide abrir un PDF/documento por su nombre, usa SIEMPRE esta etiqueta.\n"
+    "Úsalas únicamente cuando el usuario pida crear, apuntar, planificar o abrir algo "
+    "(p. ej. «créame una tarea…», «apunta una nota con…», «hazme un plan y guárdalo»). "
+    "Confirma en el texto de tu respuesta qué acción has realizado. "
+    "Nunca muestres estas etiquetas como ejemplo ni hables de ellas al usuario."
 )
 
 
@@ -38,6 +57,13 @@ def _unique_sources(results: list[dict]) -> list[str]:
     return sources
 
 
+DIRECT_SYSTEM = (
+    "Eres un asistente de IA útil y directo. Responde siempre en español, "
+    "usando formato Markdown cuando mejore la lectura. Tienes memoria de la "
+    "conversación actual."
+)
+
+
 class RagEngine:
     def __init__(self, store, cfg: dict, registry=None):
         self.store = store
@@ -54,21 +80,18 @@ class RagEngine:
         """Responde con memoria de conversación. Devuelve las fuentes usadas."""
         top_k = int(self.cfg.get("top_k", 5))
         results = self.store.query(question, top_k=top_k, doc_ids=doc_ids)
-        if not results and not space_context:
-            if doc_ids is not None and not doc_ids:
-                on_token(
-                    "No hay ninguna fuente activa. Marca al menos un documento "
-                    "en el panel de Fuentes (o cambia de categoría)."
-                )
-            else:
-                on_token(
-                    "No hay documentos en la base de conocimiento todavía. "
-                    "Sube algún PDF o documento primero."
-                )
-            return []
+
+        # Respaldo: si los documentos no aportan nada relevante, buscamos en
+        # internet (si está activado) y dejamos que el modelo use además su
+        # conocimiento general (el prompt de sistema se lo permite).
+        web_results: list[dict] = []
+        best = min((r["distance"] for r in results), default=None)
+        weak = not results or (best is not None and best > WEAK_MATCH_DISTANCE)
+        if weak and self.cfg.get("web_search", True):
+            web_results = search_web(question)
 
         context = _build_context(results)
-        
+
         full_context = ""
         if self.registry:
             all_docs = self.registry.all()
@@ -79,6 +102,20 @@ class RagEngine:
             full_context += f"Contexto extraído de los fragmentos de documentos:\n\n{context}\n\n"
         if space_context:
             full_context += f"Contexto extraído de las notas, tareas y textos del espacio actual:\n\n{space_context}\n\n"
+        if web_results:
+            web_blocks = "\n\n".join(
+                f"[Web {i}: {r['title']}]\nURL: {r['url']}\n{r['snippet']}"
+                for i, r in enumerate(web_results, start=1)
+            )
+            full_context += (
+                "Resultados de búsqueda en internet (la pregunta no encontró "
+                f"nada relevante en los documentos):\n\n{web_blocks}\n\n"
+            )
+        if not context and not space_context and not web_results:
+            full_context += (
+                "(No se ha encontrado contexto relevante en los documentos para "
+                "esta pregunta; responde con la conversación y tu conocimiento general.)\n\n"
+            )
 
         user_msg = (
             f"{full_context}"
@@ -101,7 +138,27 @@ class RagEngine:
         # Guardamos el turno "limpio" (pregunta sin contexto) en el historial.
         self.history.append({"role": "user", "content": question})
         self.history.append({"role": "assistant", "content": "".join(buffer)})
-        return _unique_sources(results)
+        sources = _unique_sources(results)
+        sources += [f"🌐 {r['title']}" for r in web_results if r.get("title")]
+        return sources
+
+    def chat_direct(self, question: str, on_token) -> list[str]:
+        """Modo directo: chatea con el modelo a pelo (sin RAG, sin agente),
+        como si usaras Ollama o LM Studio directamente. Comparte el historial
+        de la conversación con el modo app."""
+        max_msgs = max(0, int(self.cfg.get("history_turns", 6))) * 2
+        messages = self.history[-max_msgs:] + [{"role": "user", "content": question}]
+
+        buffer: list[str] = []
+
+        def collect(token: str):
+            buffer.append(token)
+            on_token(token)
+
+        stream_chat(self.cfg, DIRECT_SYSTEM, messages, collect)
+        self.history.append({"role": "user", "content": question})
+        self.history.append({"role": "assistant", "content": "".join(buffer)})
+        return []
 
     def generate(self, prompt: str, on_token, doc_ids: list[str] | None = None,
                  system: str | None = None) -> list[str]:

@@ -29,6 +29,23 @@ DEFAULTS = {
     # --- Ollama (local) ---
     "ollama_url": "http://localhost:11434",
     "ollama_model": "qwen2.5:14b",
+    # --- LM Studio (local, API compatible con OpenAI) ---
+    "lmstudio_url": "http://localhost:1234",
+    "lmstudio_model": "",
+    "lmstudio_num_ctx": 8192,  # informativo, para el medidor de contexto
+    # Modo de chat: "app" (RAG + agente integrado) o "directo" (chat puro
+    # con el modelo, como usar Ollama/LM Studio a pelo).
+    "chat_mode": "app",
+    # --- Apariencia del chat ---
+    # Tema global: "dark" (oscuro) o "light" (claro con acentos grises).
+    "theme": "dark",
+    # Estilo: "alexandria" (burbujas) o "lmstudio" (minimalista, texto plano).
+    "chat_style": "alexandria",
+    "chat_font_size": 13.5,
+    "chat_accent": "#8ea7ff",
+    "chat_bubble_opacity": 170,     # 0-255
+    "chat_show_sources": True,
+    "chat_thinking_anim": True,
     # Modelo de embeddings (memoria). Multilingüe, ideal para español.
     # La memoria es LOCAL y compartida por todos los motores de IA.
     "embedding_model": "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
@@ -36,6 +53,11 @@ DEFAULTS = {
     "top_k": 6,
     # Nº de turnos de conversación que se recuerdan en el chat.
     "history_turns": 6,
+    # Buscar en internet cuando los documentos no tienen la respuesta.
+    "web_search": True,
+    # Ventana de contexto y persistencia del modelo en Ollama.
+    "ollama_num_ctx": 8192,
+    "ollama_keep_alive": "30m",
 }
 
 # Metadatos de cada motor para la interfaz.
@@ -45,6 +67,7 @@ BACKENDS = {
     "groq": {"label": "Groq", "key_field": "groq_api_key", "model_field": "groq_model", "local": False},
     "openai": {"label": "OpenAI", "key_field": "openai_api_key", "model_field": "openai_model", "local": False},
     "ollama": {"label": "Ollama (local)", "key_field": None, "model_field": "ollama_model", "local": True},
+    "lmstudio": {"label": "LM Studio (local)", "key_field": None, "model_field": "lmstudio_model", "local": True},
 }
 
 # Variables de entorno aceptadas como alternativa a la clave guardada.

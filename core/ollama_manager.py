@@ -97,6 +97,26 @@ def list_models(url: str, timeout: float = 4.0) -> list[str]:
     return [m.get("name", "") for m in data.get("models", []) if m.get("name")]
 
 
+def warmup_model(url: str, model: str, keep_alive: str = "30m",
+                 num_ctx: int = 8192) -> None:
+    """Precarga el modelo en memoria (VRAM) para que la primera respuesta
+    no pague el coste de cargar el modelo. Llamar en segundo plano.
+
+    `num_ctx` debe coincidir con el usado en las peticiones de chat: si las
+    opciones cambian, Ollama vuelve a recargar el modelo."""
+    try:
+        requests.post(
+            f"{url.rstrip('/')}/api/chat",
+            json={
+                "model": model, "messages": [], "keep_alive": keep_alive,
+                "options": {"num_ctx": num_ctx},
+            },
+            timeout=(5, 180),
+        )
+    except requests.RequestException:
+        pass  # sin conexión o modelo remoto: no es crítico
+
+
 def pull_model(url: str, model: str, on_progress) -> None:
     """Descarga/actualiza un modelo. on_progress(status:str, percent:int).
 

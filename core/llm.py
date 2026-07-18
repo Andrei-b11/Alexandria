@@ -40,6 +40,14 @@ def stream_chat(cfg: dict, system: str, messages: list[dict], on_token) -> None:
         )
     elif backend == "ollama":
         _stream_ollama(cfg, system, messages, on_token)
+    elif backend == "lmstudio":
+        base = cfg.get("lmstudio_url", "http://localhost:1234").rstrip("/")
+        _stream_openai_compat(
+            cfg, system, messages, on_token,
+            base_url=f"{base}/v1",
+            key_field=None, model_field="lmstudio_model",
+            provider="LM Studio",
+        )
     else:
         raise LLMError(f"Motor de IA desconocido: {backend}")
 
@@ -123,12 +131,20 @@ def _stream_gemini(cfg: dict, system: str, messages: list[dict], on_token) -> No
 # ------------------------------------------- Groq / OpenAI (API compatible)
 def _stream_openai_compat(
     cfg: dict, system: str, messages: list[dict], on_token,
-    *, base_url: str, key_field: str, model_field: str, provider: str,
+    *, base_url: str, key_field: str | None, model_field: str, provider: str,
 ) -> None:
-    api_key = config.get_api_key(cfg, key_field)
-    if not api_key:
-        raise LLMError(f"Falta la API key de {provider}. Configúrala en Ajustes.")
+    headers = {}
+    if key_field is not None:  # los servidores locales (LM Studio) no piden clave
+        api_key = config.get_api_key(cfg, key_field)
+        if not api_key:
+            raise LLMError(f"Falta la API key de {provider}. Configúrala en Ajustes.")
+        headers["Authorization"] = f"Bearer {api_key}"
     model = cfg.get(model_field, "")
+    if provider == "LM Studio" and not model:
+        raise LLMError(
+            "No hay modelo de LM Studio seleccionado. Abre LM Studio, carga un "
+            "modelo en el servidor local y elígelo en Ajustes → IA local."
+        )
     payload = {
         "model": model,
         "messages": [{"role": "system", "content": system}] + messages,
@@ -137,12 +153,17 @@ def _stream_openai_compat(
     try:
         resp = requests.post(
             f"{base_url}/chat/completions",
-            headers={"Authorization": f"Bearer {api_key}"},
+            headers=headers,
             json=payload,
             stream=True,
             timeout=(10, 300),
         )
     except requests.RequestException as e:
+        if provider == "LM Studio":
+            raise LLMError(
+                f"No se pudo conectar con LM Studio en {base_url}. Abre LM Studio "
+                "y activa el servidor local (pestaña Developer → Start Server)."
+            ) from e
         raise LLMError(f"No hay conexión con la API de {provider}.") from e
     if resp.status_code == 401:
         raise LLMError(f"API key de {provider} inválida.")
@@ -183,6 +204,13 @@ def _stream_ollama(cfg: dict, system: str, messages: list[dict], on_token) -> No
         "model": model,
         "messages": [{"role": "system", "content": system}] + messages,
         "stream": True,
+        # Mantiene el modelo cargado en memoria/VRAM entre preguntas: la
+        # siguiente respuesta empieza al instante en vez de recargar el modelo.
+        "keep_alive": cfg.get("ollama_keep_alive", "30m"),
+        # Ollama usa por defecto una ventana de solo 2048 tokens y recorta el
+        # prompt por el principio: el contexto RAG expulsaba el prompt de
+        # sistema y el historial (la IA "no recordaba" la conversación).
+        "options": {"num_ctx": int(cfg.get("ollama_num_ctx", 8192))},
     }
     try:
         resp = requests.post(

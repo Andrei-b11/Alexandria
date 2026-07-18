@@ -82,3 +82,32 @@ def icon(name: str, color: str = "#c6cad2", size: int = 18) -> QIcon:
     if key not in _CACHE:
         _CACHE[key] = QIcon(pixmap(name, color, size))
     return _CACHE[key]
+
+
+def gauge_icon(percent: float, color: str = "#8ea7ff", size: int = 16) -> QIcon:
+    """Anillo de progreso SVG (0–100 %), como el medidor de contexto de
+    LM Studio. Se genera dinámicamente y se cachea por porcentaje redondeado."""
+    import math
+
+    p = max(0.0, min(1.0, percent / 100.0))
+    key = ("__gauge__", round(p, 2), color, size)
+    if key not in _CACHE:
+        c = 2 * math.pi * 9  # circunferencia (r=9 en viewBox 24)
+        svg = (
+            '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none">'
+            '<circle cx="12" cy="12" r="9" stroke="#3a3f4a" stroke-width="3"/>'
+            f'<circle cx="12" cy="12" r="9" stroke="{color}" stroke-width="3" '
+            f'stroke-linecap="round" stroke-dasharray="{c * p:.2f} {c:.2f}" '
+            'transform="rotate(-90 12 12)"/>'
+            "</svg>"
+        ).encode()
+        renderer = QSvgRenderer(QByteArray(svg))
+        pm = QPixmap(size * 2, size * 2)
+        pm.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pm)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        renderer.render(painter, QRectF(0, 0, size * 2, size * 2))
+        painter.end()
+        pm.setDevicePixelRatio(2.0)
+        _CACHE[key] = QIcon(pm)
+    return _CACHE[key]

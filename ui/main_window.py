@@ -5,10 +5,14 @@ lado, se hacen flotantes o se ocultan; la disposición se recuerda. Las notas
 y tareas viven en los Espacios, un lienzo estilo Obsidian donde se asocian
 documentos, notas, tareas y textos como tarjetas arrastrables.
 """
+import difflib
 import html
 import re
+import threading
+import unicodedata
+from pathlib import Path
 
-from PyQt6.QtCore import QPoint, QSettings, QSize, Qt
+from PyQt6.QtCore import QPoint, QSettings, QSize, Qt, QTimer
 from PyQt6.QtGui import QColor, QTextCharFormat, QTextCursor
 from PyQt6.QtWidgets import (
     QAbstractItemView,
@@ -40,16 +44,23 @@ from PyQt6.QtWidgets import (
 from core import config
 from core.extractor import SUPPORTED_EXTS, is_supported
 from core.notes import Workspace
-from core.ollama_manager import OllamaError, list_models
+from core.ollama_manager import OllamaError, list_models, warmup_model
 from core.rag import RagEngine
 from core.spaces import SpacesStore
 from core.store import DEFAULT_CATEGORY, build_store
 from core.chats import ChatHistoryStore
 import uuid
-from ui.icons import icon
+from ui.icons import gauge_icon, icon
+from ui.styles import CURRENT as THEME, apply_theme
 from ui.markdown import md_to_html
 from ui.settings_dialog import SettingsDialog
 from ui.spaces_view import SpacesView
+from ui.thinking import (
+    GeometryThinkingWidget,
+    geometry_hash_params,
+    geometry_icon_pixmap,
+    geometry_static_pixmap,
+)
 from ui.workers import (
     EnsureServerWorker,
     GenerateWorker,
@@ -84,6 +95,24 @@ STUDIO_ACTIONS = [
      "Crea un glosario con los términos técnicos que aparecen en los documentos y su definición."),
 ]
 
+def _norm(s: str) -> str:
+    """minúsculas y sin acentos, para comparar nombres de archivo."""
+    s = unicodedata.normalize("NFKD", s.lower())
+    return "".join(c for c in s if not unicodedata.combining(c))
+
+
+# «ábreme el pdf…», «abre el documento…», «muéstrame el manual…»
+_OPEN_INTENT_RE = re.compile(r"\b(abr[eií]|muestr|ensen|enseñ)\w*\b", re.I)
+_OPEN_OBJECT_RE = re.compile(r"\b(pdf|documento|archivo|fichero|manual|doc)\b", re.I)
+
+# Etiqueta de abrir documento, tolerante con los alias que alucinan los
+# modelos pequeños: [OPEN_DOC: x], [open_doc: x], [ABRIR_DOC: x], [ADD_DOC: x]…
+_OPEN_TAG_RE = re.compile(
+    r"\[\s*(?:OPEN|ABRE|ABRIR|ADD)[_ ]?(?:DOC|PDF|FILE|DOCUMENTO|ARCHIVO)\w*\s*:\s*(.+?)\s*\]",
+    re.I,
+)
+
+
 NOTE_SYSTEM = (
     "Eres un asistente que redacta apuntes claros en español a partir de "
     "fragmentos de documentos. Devuelve la nota en Markdown: empieza con un "
@@ -116,6 +145,48 @@ class ChatInput(QPlainTextEdit):
             self._on_submit()
             return
         super().keyPressEvent(event)
+
+
+class ElideButton(QPushButton):
+    """Botón cuyo texto se recorta con «…» según el ancho disponible.
+
+    Permite estrechar los paneles laterales sin que el texto se corte a
+    lo bruto; el texto completo queda como tooltip.
+    """
+
+    def __init__(self, text: str = "", parent=None):
+        super().__init__(text, parent)
+        self._full_text = text
+        if text.strip() and not self.toolTip():
+            self.setToolTip(text.strip())
+
+    def setText(self, text: str):
+        self._full_text = text
+        if text.strip() and not self.toolTip():
+            self.setToolTip(text.strip())
+        super().setText(text)
+        self._elide()
+
+    def text(self) -> str:
+        return self._full_text
+
+    def minimumSizeHint(self):
+        sh = super().minimumSizeHint()
+        sh.setWidth(56)  # permite encoger el panel; el texto se elide
+        return sh
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._elide()
+
+    def _elide(self):
+        pad = 34 + (self.iconSize().width() if not self.icon().isNull() else 0)
+        avail = max(24, self.width() - pad)
+        elided = self.fontMetrics().elidedText(
+            self._full_text, Qt.TextElideMode.ElideRight, avail
+        )
+        if elided != super().text():
+            QPushButton.setText(self, elided)
 
 
 class MainWindow(QMainWindow):
@@ -159,7 +230,18 @@ class MainWindow(QMainWindow):
         self._last_answer = ""
         self._extra_categories: set[str] = set()
 
+        # Streaming eficiente: en vez de reconstruir todo el chat por cada
+        # token, se actualiza solo la burbuja activa, agrupando tokens cada 80 ms.
+        self._stream_lbl = None       # QLabel de la respuesta en curso
+        self._think_widgets = None    # (animación, avatar estático)
+        self._stream_timer = QTimer(self)
+        self._stream_timer.setInterval(80)
+        self._stream_timer.setSingleShot(True)
+        self._stream_timer.timeout.connect(self._flush_stream)
+
         self._build_ui()
+        self._apply_chat_style()
+        self._update_context_gauge()
         self._refresh_categories()
         self._refresh_documents()
         self._update_backend_label()
@@ -325,6 +407,15 @@ class MainWindow(QMainWindow):
         sl.addWidget(self.chat_view_btn)
         sl.addWidget(self.spaces_view_btn)
         lay.addWidget(switcher)
+
+        # Acceso rápido: modo de IA (App = RAG + agente · Directo = chat puro)
+        self.mode_btn = QPushButton()
+        self.mode_btn.setObjectName("viewTab")
+        self.mode_btn.setCheckable(False)
+        self.mode_btn.clicked.connect(self._toggle_chat_mode)
+        lay.addSpacing(6)
+        lay.addWidget(self.mode_btn)
+        self._sync_mode_button()
 
         # ---------------- Centro: modelo de IA en uso ---------------------
         lay.addStretch(1)
@@ -567,7 +658,7 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------- panel Fuentes
     def _build_sources_panel(self) -> QWidget:
         frame, lay = self._panel()
-        frame.setMinimumWidth(260)
+        frame.setMinimumWidth(200)
 
         self.search_box = QLineEdit()
         self.search_box.setPlaceholderText("Buscar documento…")
@@ -592,7 +683,7 @@ class MainWindow(QMainWindow):
         cat_row.addWidget(new_cat_btn)
         lay.addLayout(cat_row)
 
-        self.add_btn = QPushButton("  Añadir fuentes")
+        self.add_btn = ElideButton("  Añadir fuentes")
         self.add_btn.setObjectName("primary")
         self.add_btn.setIcon(icon("upload", "#cdd8ff", 16))
         self.add_btn.clicked.connect(self._upload)
@@ -617,7 +708,7 @@ class MainWindow(QMainWindow):
         hint.setWordWrap(True)
         lay.addWidget(hint)
 
-        self.delete_btn = QPushButton("  Eliminar seleccionada")
+        self.delete_btn = ElideButton("  Eliminar seleccionada")
         self.delete_btn.setObjectName("danger")
         self.delete_btn.setIcon(icon("trash", ICON_MUTED, 15))
         self.delete_btn.clicked.connect(self._delete_selected)
@@ -625,6 +716,7 @@ class MainWindow(QMainWindow):
 
         self.sources_count = QLabel("")
         self.sources_count.setObjectName("muted")
+        self.sources_count.setWordWrap(True)
         lay.addWidget(self.sources_count)
         return frame
 
@@ -635,6 +727,7 @@ class MainWindow(QMainWindow):
         cl.setContentsMargins(10, 8, 10, 10)
         frame, lay = self._panel()
         frame.setObjectName("chatPanel")
+        self.chat_frame = frame  # para alternar el estilo visual del chat
         cl.addWidget(frame)
 
         self.setup_banner = QFrame()
@@ -676,6 +769,20 @@ class MainWindow(QMainWindow):
         self.input_count = QLabel("")
         self.input_count.setObjectName("muted")
         ib.addWidget(self.input_count)
+
+        # Medidor de contexto (estilo LM Studio): % estimado de la ventana
+        # del modelo que ocupará la próxima pregunta. Clic = desglose y ajuste.
+        self.ctx_btn = QPushButton("")
+        self.ctx_btn.setStyleSheet(
+            "QPushButton { background: transparent; border: none; color: #8b909a;"
+            " font-size: 11px; padding: 0 4px; }"
+            "QPushButton:hover { color: #c6cad2; }"
+        )
+        self.ctx_btn.setFixedHeight(30)
+        self.ctx_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.ctx_btn.clicked.connect(self._show_context_menu)
+        ib.addWidget(self.ctx_btn)
+
         self.send_btn = QPushButton()
         self.send_btn.setObjectName("sendCircle")
         self.send_btn.setIcon(icon("send", "#0b0c0f", 16))
@@ -687,63 +794,161 @@ class MainWindow(QMainWindow):
         return container
 
     # --------------------------------------------------------- panel Studio
+    @staticmethod
+    def _studio_section(text: str) -> QLabel:
+        lbl = QLabel(text.upper())
+        lbl.setWordWrap(True)
+        lbl.setStyleSheet(
+            f"color: {THEME['FAINT']}; font-size: 10px; font-weight: 700; "
+            "letter-spacing: 1.2px; margin-top: 6px; background: transparent;"
+        )
+        return lbl
+
     def _build_studio_panel(self) -> QWidget:
         frame, lay = self._panel()
-        frame.setMinimumWidth(295)
-
-        hint = QLabel("Acciones rápidas sobre tus fuentes activas:")
-        hint.setObjectName("muted")
-        hint.setWordWrap(True)
-        lay.addWidget(hint)
+        frame.setMinimumWidth(210)
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setStyleSheet("QScrollArea, QScrollArea > QWidget > QWidget { background: transparent; }")
         inner = QWidget()
         il = QVBoxLayout(inner)
         il.setContentsMargins(0, 0, 4, 0)
         il.setSpacing(8)
-        for icon_name, label, prompt in STUDIO_ACTIONS:
-            card = QPushButton("  " + label)
-            card.setObjectName("studioCard")
-            card.setIcon(icon(icon_name, ICON_ACCENT, 17))
-            card.setIconSize(QSize(17, 17))
-            card.setMinimumHeight(46)
-            card.clicked.connect(lambda _=False, p=prompt: self._send_preset(p))
-            il.addWidget(card)
-        il.addStretch(1)
-        scroll.setWidget(inner)
-        lay.addWidget(scroll, 1)
 
-        create_hint = QLabel("Crear con IA en el espacio actual:")
-        create_hint.setObjectName("muted")
-        lay.addWidget(create_hint)
+        # ------------------------------------------------------ estado
+        il.addWidget(self._studio_section("Estado"))
+        status_card = QFrame()
+        status_card.setObjectName("panel")
+        sc = QVBoxLayout(status_card)
+        sc.setContentsMargins(12, 10, 12, 10)
+        sc.setSpacing(5)
+        self.studio_engine_lbl = QLabel("")
+        self.studio_engine_lbl.setWordWrap(True)
+        self.studio_engine_lbl.setStyleSheet("font-weight: 600; background: transparent;")
+        self.studio_mode_lbl = QLabel("")
+        self.studio_mode_lbl.setObjectName("muted")
+        self.studio_mode_lbl.setWordWrap(True)
+        self.studio_kb_lbl = QLabel("")
+        self.studio_kb_lbl.setObjectName("muted")
+        self.studio_kb_lbl.setWordWrap(True)
+        sc.addWidget(self.studio_engine_lbl)
+        sc.addWidget(self.studio_mode_lbl)
+        sc.addWidget(self.studio_kb_lbl)
+        mode_btn = ElideButton("  Cambiar modo App / Directo")
+        mode_btn.setIcon(icon("refresh", ICON_MUTED, 13))
+        mode_btn.clicked.connect(self._toggle_chat_mode)
+        sc.addWidget(mode_btn)
+        il.addWidget(status_card)
 
-        ai_note_btn = QPushButton("  Nota con IA")
+        # ------------------------------------------------- conversación
+        il.addWidget(self._studio_section("Conversación"))
+        regen_btn = ElideButton("  Regenerar última respuesta")
+        regen_btn.setIcon(icon("refresh", ICON_ACCENT, 14))
+        regen_btn.setToolTip("Vuelve a preguntar lo mismo y sustituye la última respuesta")
+        regen_btn.clicked.connect(self._regenerate_last)
+        il.addWidget(regen_btn)
+
+        copy_btn = ElideButton("  Copiar última respuesta")
+        copy_btn.setIcon(icon("clipboard", ICON_MUTED, 14))
+        copy_btn.clicked.connect(self._copy_last_answer)
+        il.addWidget(copy_btn)
+
+        self.save_answer_btn = ElideButton("  Guardar última respuesta como nota")
+        self.save_answer_btn.setIcon(icon("save", ICON_MUTED, 14))
+        self.save_answer_btn.clicked.connect(self._save_answer_as_note)
+        il.addWidget(self.save_answer_btn)
+
+        # ------------------------------------------------- crear con IA
+        il.addWidget(self._studio_section("Crear con IA en el espacio actual"))
+        ai_note_btn = ElideButton("  Nota con IA")
         ai_note_btn.setObjectName("primary")
         ai_note_btn.setIcon(icon("sparkles", "#cdd8ff", 15))
         ai_note_btn.setToolTip("Genera unos apuntes y los coloca en el espacio actual")
         ai_note_btn.clicked.connect(self._ai_note)
-        lay.addWidget(ai_note_btn)
+        il.addWidget(ai_note_btn)
 
-        ai_tasks_btn = QPushButton("  Extraer tareas de los documentos")
+        ai_tasks_btn = ElideButton("  Extraer tareas de los documentos")
         ai_tasks_btn.setObjectName("primary")
         ai_tasks_btn.setIcon(icon("list-checks", "#cdd8ff", 15))
         ai_tasks_btn.setToolTip("Extrae tareas y las coloca en el espacio actual")
         ai_tasks_btn.clicked.connect(self._ai_tasks)
-        lay.addWidget(ai_tasks_btn)
+        il.addWidget(ai_tasks_btn)
 
-        self.save_answer_btn = QPushButton("  Guardar última respuesta como nota")
-        self.save_answer_btn.setIcon(icon("save", ICON_MUTED, 15))
-        self.save_answer_btn.clicked.connect(self._save_answer_as_note)
-        lay.addWidget(self.save_answer_btn)
+        # --------------------------------------------- análisis rápido
+        il.addWidget(self._studio_section("Análisis rápido"))
+        for icon_name, label, prompt in STUDIO_ACTIONS[:3]:
+            card = ElideButton("  " + label)
+            card.setObjectName("studioCard")
+            card.setIcon(icon(icon_name, ICON_ACCENT, 15))
+            card.setIconSize(QSize(15, 15))
+            card.clicked.connect(lambda _=False, p=prompt: self._send_preset(p))
+            il.addWidget(card)
+
+        il.addStretch(1)
+        scroll.setWidget(inner)
+        lay.addWidget(scroll, 1)
 
         self.studio_info = QLabel("")
         self.studio_info.setObjectName("muted")
         self.studio_info.setWordWrap(True)
         lay.addWidget(self.studio_info)
         return frame
+
+    def _refresh_studio_status(self):
+        if not hasattr(self, "studio_engine_lbl"):
+            return
+        backend = self.cfg.get("backend", "claude")
+        meta = config.BACKENDS.get(backend, config.BACKENDS["claude"])
+        kind = "local" if meta["local"] else "nube"
+        self.studio_engine_lbl.setText(
+            f"{meta['label']} · {config.active_model(self.cfg) or '(sin modelo)'}"
+        )
+        mode = self.cfg.get("chat_mode", "app")
+        self.studio_mode_lbl.setText(
+            ("Motor local · " if kind == "local" else "Motor en la nube · ")
+            + ("modo App (documentos + agente)" if mode == "app" else "chat directo")
+        )
+        docs = self.registry.all()
+        chunks = sum(int(d.get("chunks", 0)) for d in docs)
+        cats = len(self.registry.categories())
+        cat_txt = "categoría" if cats == 1 else "categorías"
+        self.studio_kb_lbl.setText(
+            f"Base de conocimiento: {len(docs)} documentos · "
+            f"{chunks:,} fragmentos · {cats} {cat_txt}".replace(",", ".")
+        )
+
+    def _regenerate_last(self):
+        """Repite la última pregunta descartando la respuesta anterior."""
+        if self.query_worker is not None:
+            self.statusBar().showMessage("Espera a que termine la respuesta actual", 4000)
+            return
+        question = next(
+            (m["content"] for m in reversed(self._messages) if m["role"] == "user"), None
+        )
+        if not question:
+            self.statusBar().showMessage("No hay ninguna pregunta que regenerar", 4000)
+            return
+        # Quitar el último par pregunta/respuesta del chat y del historial RAG.
+        while self._messages and self._messages[-1]["role"] == "assistant":
+            self._messages.pop()
+        if self._messages and self._messages[-1]["role"] == "user":
+            self._messages.pop()
+        if self.rag.history and self.rag.history[-1]["role"] == "assistant":
+            self.rag.history.pop()
+        if self.rag.history and self.rag.history[-1:] and self.rag.history[-1]["role"] == "user":
+            self.rag.history.pop()
+        self.input.setPlainText(question)
+        self._send()
+
+    def _copy_last_answer(self):
+        if not self._last_answer.strip():
+            self.statusBar().showMessage("Todavía no hay ninguna respuesta que copiar", 4000)
+            return
+        QApplication.clipboard().setText(self._last_answer)
+        self.statusBar().showMessage("Respuesta copiada al portapapeles", 4000)
 
     # ============================================================== helpers
     def _clear_chat_layout(self):
@@ -772,7 +977,7 @@ class MainWindow(QMainWindow):
         
         title_lbl = QLabel("Tu base de conocimiento")
         title_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        title_lbl.setStyleSheet("font-size: 21px; font-weight: bold; color: #f1f1f1; background: transparent;")
+        title_lbl.setStyleSheet(f"font-size: 21px; font-weight: bold; color: {THEME['TEXT_STRONG']}; background: transparent;")
         title_lbl.setWordWrap(True)
         wl.addWidget(title_lbl)
         
@@ -781,7 +986,7 @@ class MainWindow(QMainWindow):
             "y pregúntame sobre su contenido. Respondo solo con lo que has subido."
         )
         desc_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        desc_lbl.setStyleSheet("color: #8b909a; font-size: 13.5px; background: transparent;")
+        desc_lbl.setStyleSheet(f"color: {THEME['MUTED']}; font-size: 13.5px; background: transparent;")
         desc_lbl.setWordWrap(True)
         wl.addWidget(desc_lbl)
         
@@ -790,7 +995,7 @@ class MainWindow(QMainWindow):
             "notas y tareas<br>como tarjetas que puedes mover a tu gusto (estilo Obsidian Canvas)."
         )
         tip_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        tip_lbl.setStyleSheet("color: #5f646e; font-size: 12px; margin-top: 10px; background: transparent;")
+        tip_lbl.setStyleSheet(f"color: {THEME['FAINT']}; font-size: 12px; margin-top: 10px; background: transparent;")
         tip_lbl.setWordWrap(True)
         wl.addWidget(tip_lbl)
         
@@ -804,10 +1009,45 @@ class MainWindow(QMainWindow):
             self.chat_scroll.verticalScrollBar().maximum()
         ))
 
+    def _assistant_html(self, content: str) -> str:
+        body_html = md_to_html(content)
+        fs = float(self.cfg.get("chat_font_size", 13.5))
+        code_bg = THEME["CODE_BG"]
+        return (
+            "<style>"
+            "p { margin: 0 0 6px 0; } p:last-child { margin: 0; } "
+            "ul, ol { margin: 0 0 6px 0; padding-left: 18px; } "
+            "li { margin-bottom: 2px; } "
+            f"pre {{ background-color: {code_bg}; padding: 8px; border-radius: 6px; margin: 4px 0; font-family: monospace; }} "
+            f"code {{ font-family: monospace; background-color: {code_bg}; padding: 2px 4px; border-radius: 4px; }} "
+            "</style>"
+            f'<div style="color: {THEME["CHAT_TEXT"]}; font-size: {fs}px; line-height: 1.45;">{body_html}</div>'
+        )
+
+    def _message_icon(self, msg: dict, size: int = 30):
+        """Icono geométrico propio de cada respuesta: el fotograma congelado
+        de su animación o, para mensajes antiguos, uno derivado de su texto."""
+        params = msg.get("icon")
+        if not isinstance(params, dict):
+            content = msg.get("content", "")
+            if not content:
+                return geometry_static_pixmap(size)
+            params = geometry_hash_params(content)
+        return geometry_icon_pixmap(params, size)
+
     def _render_chat(self):
         """Reconstruye el chat completo usando widgets nativos para tarjetas redondeadas y semitransparentes."""
         self._clear_chat_layout()
-        
+        self._stream_lbl = None
+        self._think_widgets = None
+
+        accent = self.cfg.get("chat_accent", "#8ea7ff")
+        opacity = max(0, min(255, int(self.cfg.get("chat_bubble_opacity", 170))))
+        fs = float(self.cfg.get("chat_font_size", 13.5))
+        show_sources = bool(self.cfg.get("chat_show_sources", True))
+        anim_enabled = bool(self.cfg.get("chat_thinking_anim", True))
+        lms = self.cfg.get("chat_style", "alexandria") == "lmstudio"
+
         for msg in self._messages:
             role = msg["role"]
             content = msg["content"]
@@ -828,79 +1068,266 @@ class MainWindow(QMainWindow):
             
             if role == "user":
                 bubble.setObjectName("userBubble")
-                bubble.setStyleSheet("""
-                    QFrame#userBubble {
-                        background-color: rgba(43, 49, 62, 160);
-                        border: 1px solid #3a4456;
-                        border-radius: 16px;
-                    }
-                """)
-                role_lbl.setText("TÚ")
-                role_lbl.setStyleSheet(role_lbl.styleSheet() + " color: #8ea7ff;")
-                
                 safe = html.escape(content).replace("\n", "<br>")
-                content_lbl.setText(f'<div style="color: #ffffff; font-size: 13.5px; line-height: 1.45;">{safe}</div>')
-                bl.addWidget(role_lbl)
-                bl.addWidget(content_lbl)
-                
+                content_lbl.setText(f'<div style="color: {THEME["CHAT_TEXT_STRONG"]}; font-size: {fs}px; line-height: 1.45;">{safe}</div>')
+
+                if lms:
+                    # Estilo LM Studio: burbuja compacta gris, sin etiqueta «TÚ»
+                    bubble.setContentsMargins(12, 8, 12, 8)
+                    bubble.setStyleSheet(f"""
+                        QFrame#userBubble {{
+                            background-color: {THEME["LMS_USER_BG"]};
+                            border: none;
+                            border-radius: 10px;
+                        }}
+                    """)
+                    bl.addWidget(content_lbl)
+                else:
+                    bubble.setStyleSheet(f"""
+                        QFrame#userBubble {{
+                            background-color: rgba({THEME["CHAT_USER_RGB"]}, {min(255, opacity - 10 if opacity > 70 else opacity)});
+                            border: 1px solid {THEME["CHAT_USER_BORDER"]};
+                            border-radius: 16px;
+                        }}
+                    """)
+                    role_lbl.setText("TÚ")
+                    role_lbl.setStyleSheet(role_lbl.styleSheet() + f" color: {accent};")
+                    bl.addWidget(role_lbl)
+                    bl.addWidget(content_lbl)
+
                 # Fila contenedora para alinear a la derecha
                 row = QWidget()
                 rl = QHBoxLayout(row)
                 rl.setContentsMargins(0, 0, 0, 0)
-                rl.addStretch(1)
-                rl.addWidget(bubble, 4) # Ocupa como máximo el 80% del ancho
+                if lms:
+                    rl.addStretch(2)
+                    rl.addWidget(bubble)  # tamaño según el contenido
+                else:
+                    rl.addStretch(1)
+                    rl.addWidget(bubble, 4)  # Ocupa como máximo el 80% del ancho
                 self.chat_layout.addWidget(row)
             else:
                 bubble.setObjectName("assistantBubble")
-                bubble.setStyleSheet("""
-                    QFrame#assistantBubble {
-                        background-color: rgba(23, 26, 32, 170);
-                        border: 1px solid #242830;
-                        border-radius: 16px;
-                    }
-                """)
-                role_lbl.setText("ASISTENTE")
-                role_lbl.setStyleSheet(role_lbl.styleSheet() + " color: #9fb4c9;")
-                
-                body_html = md_to_html(content)
-                html_styled = (
-                    "<style>"
-                    "p { margin: 0 0 6px 0; } p:last-child { margin: 0; } "
-                    "ul, ol { margin: 0 0 6px 0; padding-left: 18px; } "
-                    "li { margin-bottom: 2px; } "
-                    "pre { background-color: #0b0c0f; padding: 8px; border-radius: 6px; margin: 4px 0; font-family: monospace; } "
-                    "code { font-family: monospace; background-color: #0b0c0f; padding: 2px 4px; border-radius: 4px; } "
-                    "</style>"
-                    f'<div style="color: #dfe1e4; font-size: 13.5px; line-height: 1.45;">{body_html}</div>'
-                )
-                content_lbl.setText(html_styled)
-                bl.addWidget(role_lbl)
+                if lms:
+                    # Estilo LM Studio: sin burbuja, texto plano a ancho completo
+                    bubble.setContentsMargins(4, 6, 4, 10)
+                    bubble.setStyleSheet(
+                        "QFrame#assistantBubble { background: transparent; border: none; }"
+                    )
+                    role_lbl.setText(config.active_model(self.cfg))
+                    role_lbl.setStyleSheet(
+                        "font-size: 11px; font-family: Consolas, 'Cascadia Mono', monospace; "
+                        f"color: {THEME['MUTED']}; background: transparent;"
+                    )
+                else:
+                    bubble.setStyleSheet(f"""
+                        QFrame#assistantBubble {{
+                            background-color: rgba({THEME["CHAT_AI_RGB"]}, {opacity});
+                            border: 1px solid {THEME["CHAT_AI_BORDER"]};
+                            border-radius: 16px;
+                        }}
+                    """)
+                    role_lbl.setText("ASISTENTE")
+                    role_lbl.setStyleSheet(role_lbl.styleSheet() + f" color: {THEME['ROLE_AI']};")
+
+                content_lbl.setText(self._assistant_html(content))
+
+                # Cabecera con avatar: animación mientras piensa; al terminar,
+                # su último fotograma queda como icono único de esa respuesta.
+                thinking = bool(msg.get("thinking")) and not content
+                header = QWidget()
+                header.setStyleSheet("background: transparent;")
+                hl = QHBoxLayout(header)
+                hl.setContentsMargins(0, 0, 0, 2)
+                hl.setSpacing(8)
+
+                av_size = 20 if lms else 30
+                anim = None
+                if thinking and anim_enabled:
+                    anim = GeometryThinkingWidget(av_size)
+                    hl.addWidget(anim)
+                avatar_lbl = QLabel()
+                avatar_lbl.setPixmap(self._message_icon(msg, av_size))
+                avatar_lbl.setFixedSize(av_size, av_size)
+                avatar_lbl.setStyleSheet("background: transparent;")
+                hl.addWidget(avatar_lbl)
+                hl.addWidget(role_lbl)
+                if thinking:
+                    if anim is not None:
+                        avatar_lbl.hide()
+                    content_lbl.hide()
+                    self._think_widgets = (anim, avatar_lbl)
+                hl.addStretch(1)
+
+                bl.addWidget(header)
                 bl.addWidget(content_lbl)
-                
-                if msg.get("sources"):
+                self._stream_lbl = content_lbl
+
+                if msg.get("sources") and show_sources:
                     label = ", ".join(html.escape(s) for s in msg["sources"])
                     src_lbl = QLabel(f"<b>Fuentes:</b> {label}")
                     src_lbl.setWordWrap(True)
-                    src_lbl.setStyleSheet("color: #6f7378; font-size: 11px; margin-top: 4px; background: transparent;")
+                    src_lbl.setStyleSheet(f"color: {THEME['SRC_TEXT']}; font-size: 11px; margin-top: 4px; background: transparent;")
                     bl.addWidget(src_lbl)
-                
+
                 # Fila contenedora para alinear a la izquierda
                 row = QWidget()
                 rl = QHBoxLayout(row)
                 rl.setContentsMargins(0, 0, 0, 0)
-                rl.addWidget(bubble, 4) # Ocupa como máximo el 80%
-                rl.addStretch(1)
+                if lms:
+                    rl.addWidget(bubble, 1)  # ancho completo, sin burbuja
+                else:
+                    rl.addWidget(bubble, 4)  # Ocupa como máximo el 80%
+                    rl.addStretch(1)
                 self.chat_layout.addWidget(row)
                 
         # Añadir un stretch al final para empujar todo el contenido hacia arriba
         self.chat_layout.addStretch(1)
         self._scroll_bottom()
 
+    # ------------------------------------------------ medidor de contexto
+    _CTX_LIMITS = {"claude": 200_000, "gemini": 1_000_000,
+                   "groq": 131_072, "openai": 128_000}
+
+    def _estimate_context_usage(self) -> tuple[int, dict]:
+        """Estima los tokens (≈ caracteres/4) que ocupará la próxima pregunta
+        y devuelve (límite, desglose por componente)."""
+        def toks(s: str) -> int:
+            return len(s) // 4 + 1
+
+        from core.rag import DIRECT_SYSTEM, SYSTEM_PROMPT
+
+        direct = self.cfg.get("chat_mode", "app") == "direct"
+        parts: dict[str, int] = {}
+        parts["Prompt de sistema"] = toks(DIRECT_SYSTEM if direct else SYSTEM_PROMPT)
+
+        max_msgs = max(0, int(self.cfg.get("history_turns", 6))) * 2
+        hist = self.rag.history[-max_msgs:]
+        parts[f"Historial ({len(hist)} mensajes)"] = sum(toks(m["content"]) for m in hist)
+
+        if not direct:
+            top_k = int(self.cfg.get("top_k", 6))
+            docs = self.registry.all()
+            # fragmentos de ~900 caracteres + lista de documentos disponibles
+            rag_toks = top_k * (900 // 4)
+            rag_toks += sum(toks(d["filename"]) + 2 for d in docs)
+            parts[f"Documentos (RAG, {top_k} fragmentos)"] = rag_toks
+
+        backend = self.cfg.get("backend", "claude")
+        if backend == "ollama":
+            limit = int(self.cfg.get("ollama_num_ctx", 8192))
+        elif backend == "lmstudio":
+            limit = int(self.cfg.get("lmstudio_num_ctx", 8192))
+        else:
+            limit = self._CTX_LIMITS.get(backend, 128_000)
+        return limit, parts
+
+    def _update_context_gauge(self):
+        # Re-estilar aquí mantiene el botón acorde al tema activo (se llama
+        # también al guardar Ajustes).
+        self.ctx_btn.setStyleSheet(
+            "QPushButton { background: transparent; border: none;"
+            f" color: {THEME['MUTED']}; font-size: 11px; padding: 0 4px; }}"
+            f"QPushButton:hover {{ color: {THEME['TEXT_STRONG']}; }}"
+        )
+        limit, parts = self._estimate_context_usage()
+        total = sum(parts.values())
+        pct = min(100, round(total / limit * 100))
+        color = THEME["ACCENT"] if pct < 75 else ("#e8a33d" if pct < 90 else "#e05252")
+        self.ctx_btn.setIcon(gauge_icon(pct, color, 15))
+        self.ctx_btn.setText(f" {pct}%")
+        detail = "\n".join(f"  · {k}: ~{v:,}".replace(",", ".") for k, v in parts.items())
+        self.ctx_btn.setToolTip(
+            f"Contexto estimado de la próxima pregunta:\n"
+            f"~{total:,} de {limit:,} tokens ({pct}%)\n{detail}\n"
+            "Clic para ver opciones.".replace(",", ".")
+        )
+
+    def _show_context_menu(self):
+        limit, parts = self._estimate_context_usage()
+        total = sum(parts.values())
+        pct = min(100, round(total / limit * 100))
+
+        menu = QMenu(self)
+        head = menu.addAction(f"Contexto: ~{total:,} / {limit:,} tokens ({pct}%)".replace(",", "."))
+        head.setEnabled(False)
+        for k, v in parts.items():
+            act = menu.addAction(f"   {k}: ~{v:,}".replace(",", "."))
+            act.setEnabled(False)
+
+        if self.cfg.get("backend") == "ollama":
+            menu.addSeparator()
+            size_menu = menu.addMenu("Ventana de contexto (Ollama)")
+            current = int(self.cfg.get("ollama_num_ctx", 8192))
+            for n in (4096, 8192, 16384, 32768):
+                act = size_menu.addAction(f"{n:,} tokens".replace(",", "."))
+                act.setCheckable(True)
+                act.setChecked(n == current)
+                act.triggered.connect(lambda _, n=n: self._set_ollama_ctx(n))
+        menu.exec(self.ctx_btn.mapToGlobal(QPoint(0, -10 - menu.sizeHint().height() + 10)))
+
+    def _set_ollama_ctx(self, n: int):
+        self.cfg["ollama_num_ctx"] = n
+        config.save_config(self.cfg)
+        self._update_context_gauge()
+        self._warmup_ollama_model()  # recarga el modelo con la nueva ventana
+        self.statusBar().showMessage(
+            f"Ventana de contexto de Ollama: {n} tokens (el modelo se recarga en segundo plano)", 6000
+        )
+
+    def _apply_chat_style(self):
+        """Fondo del panel de chat según el estilo: Alexandria (degradado con
+        trama) o LM Studio (plano y minimalista)."""
+        if self.cfg.get("chat_style", "alexandria") == "lmstudio":
+            self.chat_frame.setStyleSheet(f"""
+                QFrame#chatPanel {{
+                    background: {THEME["LMS_PANEL_BG"]};
+                    background-image: none;
+                    border: 1px solid {THEME["BORDER_SOFT"]};
+                    border-radius: 16px;
+                }}
+            """)
+        else:
+            self.chat_frame.setStyleSheet("")  # vuelve al estilo global
+
     def _update_backend_label(self):
         backend = self.cfg.get("backend", "claude")
         meta = config.BACKENDS.get(backend, config.BACKENDS["claude"])
         kind = "local" if meta["local"] else "nube"
-        self.chip.setText(f"{meta['label']} · {config.active_model(self.cfg)} · {kind}")
+        mode = "modo app" if self.cfg.get("chat_mode", "app") == "app" else "chat directo"
+        self.chip.setText(
+            f"{meta['label']} · {config.active_model(self.cfg)} · {kind} · {mode}"
+        )
+        self._refresh_studio_status()
+
+    def _sync_mode_button(self):
+        if self.cfg.get("chat_mode", "app") == "app":
+            self.mode_btn.setText(" IA: App")
+            self.mode_btn.setIcon(icon("sparkles", ICON_ACCENT, 13))
+            self.mode_btn.setToolTip(
+                "Modo App: responde con tus documentos (RAG) y puede crear "
+                "tareas/notas y abrir PDFs.\nClic para cambiar a chat directo."
+            )
+        else:
+            self.mode_btn.setText(" IA: Directo")
+            self.mode_btn.setIcon(icon("message", "#ffc46b", 13))
+            self.mode_btn.setToolTip(
+                "Chat directo: habla con el modelo a pelo, como en Ollama o "
+                "LM Studio (sin documentos ni agente).\nClic para volver al modo App."
+            )
+
+    def _toggle_chat_mode(self):
+        new_mode = "direct" if self.cfg.get("chat_mode", "app") == "app" else "app"
+        self.cfg["chat_mode"] = new_mode
+        config.save_config(self.cfg)
+        self._sync_mode_button()
+        self._update_backend_label()
+        self._update_context_gauge()
+        self.statusBar().showMessage(
+            "Modo App: respuestas con tus documentos y agente integrado" if new_mode == "app"
+            else "Chat directo: conversación pura con el modelo (sin documentos)",
+            5000,
+        )
 
     # ------------------------------------------------- disposición ventana
     def _settings(self) -> QSettings:
@@ -1017,6 +1444,7 @@ class MainWindow(QMainWindow):
             "Sube documentos para activar las acciones." if total == 0
             else "Las acciones usan las fuentes activas del panel de Fuentes."
         )
+        self._refresh_studio_status()
 
     def _on_doc_check_changed(self, item: QListWidgetItem):
         doc_id = item.data(Qt.ItemDataRole.UserRole)
@@ -1221,7 +1649,8 @@ class MainWindow(QMainWindow):
             installed = []
         if model in installed:
             self._hide_setup_banner()
-            self.statusBar().showMessage("IA local lista", 4000)
+            self.statusBar().showMessage("IA local lista · precargando el modelo…", 4000)
+            self._warmup_ollama_model()
             return
         self._show_setup_banner(
             f"Preparando la IA local: descargando el modelo «{model}» "
@@ -1249,6 +1678,20 @@ class MainWindow(QMainWindow):
         self._hide_setup_banner()
         self._set_sending(True)
         self.statusBar().showMessage("IA local lista", 4000)
+        self._warmup_ollama_model()
+
+    def _warmup_ollama_model(self):
+        """Carga el modelo de Ollama en VRAM en segundo plano para que la
+        primera pregunta responda al instante."""
+        url = self.cfg.get("ollama_url")
+        model = self.cfg.get("ollama_model")
+        if url and model:
+            num_ctx = int(self.cfg.get("ollama_num_ctx", 8192))
+            threading.Thread(
+                target=warmup_model, args=(url, model),
+                kwargs={"num_ctx": num_ctx},
+                daemon=True, name="ollama-warmup",
+            ).start()
 
     def _on_setup_error(self, message: str):
         self.pull_worker = None
@@ -1276,6 +1719,7 @@ class MainWindow(QMainWindow):
         self._current_chat_id = uuid.uuid4().hex[:12]
         self._welcome()
         self._show_view(0)
+        self._update_context_gauge()
         self.statusBar().showMessage("Conversación nueva", 3000)
 
     def _save_current_chat(self):
@@ -1325,6 +1769,7 @@ class MainWindow(QMainWindow):
             self._current_chat_id = chat_id
             self._messages = list(chat.get("messages", []))
             self.rag.history = list(chat.get("rag_history", []))
+            self._update_context_gauge()
             self._last_answer = ""
             for msg in reversed(self._messages):
                 if msg["role"] == "assistant":
@@ -1433,6 +1878,9 @@ class MainWindow(QMainWindow):
 
     def _send(self):
         if self.query_worker is not None:
+            # El botón funciona como «detener» mientras la IA responde.
+            self.query_worker.cancelled = True
+            self.statusBar().showMessage("Deteniendo la respuesta…", 3000)
             return
         question = self.input.toPlainText().strip()
         if not question:
@@ -1441,17 +1889,24 @@ class MainWindow(QMainWindow):
 
         # Añadimos el mensaje del usuario y un marcador para el asistente en streaming
         self._messages.append({"role": "user", "content": question})
-        self._messages.append({"role": "assistant", "content": "Pensando…", "sources": []})
+        self._messages.append(
+            {"role": "assistant", "content": "", "sources": [], "thinking": True}
+        )
         self._current_answer = []
         self._render_chat()
 
-        self.send_btn.setEnabled(False)
+        self.send_btn.setIcon(icon("x", "#0b0c0f", 16))
+        self.send_btn.setToolTip("Detener la respuesta")
         self.input.setEnabled(False)
         self.statusBar().showMessage("Pensando…")
 
-        space_ctx = self._current_space_context_str()
+        direct = self.cfg.get("chat_mode", "app") == "direct"
+        space_ctx = None if direct else self._current_space_context_str()
 
-        self.query_worker = QueryWorker(self.rag, question, self._active_doc_ids(), space_context=space_ctx)
+        self.query_worker = QueryWorker(
+            self.rag, question, self._active_doc_ids(),
+            space_context=space_ctx, direct=direct,
+        )
         self.query_worker.token.connect(self._on_answer_token)
         self.query_worker.sources_ready.connect(self._on_sources)
         self.query_worker.error.connect(self._on_query_error)
@@ -1462,52 +1917,198 @@ class MainWindow(QMainWindow):
         self._current_answer.append(token)
         if self._messages and self._messages[-1]["role"] == "assistant":
             self._messages[-1]["content"] = "".join(self._current_answer)
-        self._render_chat()
+        # Agrupamos tokens: la burbuja se refresca como mucho cada 80 ms en vez
+        # de reconstruir todo el chat por cada token (mucho más fluido).
+        if not self._stream_timer.isActive():
+            self._stream_timer.start()
+
+    def _flush_stream(self):
+        if not self._messages or self._messages[-1]["role"] != "assistant":
+            return
+        msg = self._messages[-1]
+        if msg.get("thinking") and msg["content"]:
+            msg.pop("thinking", None)
+            self._freeze_thinking()
+        if self._stream_lbl is None:
+            return
+        try:
+            self._stream_lbl.setText(self._assistant_html(msg["content"]))
+            self._stream_lbl.show()
+        except RuntimeError:
+            self._stream_lbl = None  # la burbuja fue reconstruida entre medias
+            return
+        self._scroll_bottom()
+
+    def _freeze_thinking(self):
+        """Detiene la animación y deja su último fotograma como icono único y
+        permanente de esta respuesta (sello de que terminó de pensar)."""
+        if self._think_widgets is None:
+            return
+        anim, avatar_lbl = self._think_widgets
+        try:
+            if anim is not None:
+                # El fotograma exacto en que dejó de pensar identifica esta
+                # respuesta; sus parámetros se guardan con el mensaje.
+                if self._messages and self._messages[-1]["role"] == "assistant":
+                    self._messages[-1]["icon"] = anim.state.params()
+                if avatar_lbl is not None:
+                    avatar_lbl.setPixmap(anim.snapshot())
+                anim.hide()
+            if avatar_lbl is not None:
+                avatar_lbl.show()
+        except RuntimeError:
+            pass  # la burbuja fue reconstruida entre medias
+        self._think_widgets = None
 
     def _on_sources(self, sources: list):
         answer = "".join(self._current_answer)
-        
-        # Interceptar comando de apertura de documento [OPEN_DOC: nombre_archivo]
-        import re
-        match = re.search(r"\[OPEN_DOC:\s*(.+?)\]", answer)
-        if match:
-            filename = match.group(1).strip()
-            answer = re.sub(r"\[OPEN_DOC:\s*(.+?)\]", "", answer).strip()
-            
-            all_docs = self.registry.all()
-            doc = next((d for d in all_docs if d["filename"].lower() == filename.lower() or filename.lower() in d["filename"].lower()), None)
-            if doc and doc.get("path"):
-                from PyQt6.QtGui import QDesktopServices
-                from PyQt6.QtCore import QUrl
-                QDesktopServices.openUrl(QUrl.fromLocalFile(doc["path"]))
-                self.statusBar().showMessage(f"Documento abierto: {doc['filename']}", 4000)
-            else:
-                self.statusBar().showMessage(f"No se pudo encontrar el archivo: {filename}", 4000)
-
+        question = next(
+            (m["content"] for m in reversed(self._messages) if m["role"] == "user"), ""
+        )
+        answer = self._apply_agent_actions(answer, question=question)
         self._last_answer = answer
         if self._messages and self._messages[-1]["role"] == "assistant":
             self._messages[-1]["content"] = answer
             self._messages[-1]["sources"] = sources
+            self._messages[-1].pop("thinking", None)
         else:
             self._messages.append(
                 {"role": "assistant", "content": answer, "sources": sources}
             )
         self._save_current_chat()
 
+    # ------------------------------------------- abrir documentos (agente)
+    def _find_doc(self, name: str) -> dict | None:
+        """Busca un documento por nombre con tolerancia a mayúsculas, acentos,
+        extensión omitida y nombres aproximados."""
+        docs = self.registry.all()
+        target = _norm(name.strip())
+        tstem = _norm(Path(name.strip()).stem)
+        if not target:
+            return None
+        for d in docs:
+            if _norm(d["filename"]) == target:
+                return d
+        for d in docs:
+            fn = _norm(d["filename"])
+            stem = _norm(Path(d["filename"]).stem)
+            if target in fn or (tstem and (tstem in stem or stem in tstem)):
+                return d
+        stems = {}
+        for d in docs:
+            stems.setdefault(_norm(Path(d["filename"]).stem), d)
+        close = difflib.get_close_matches(tstem, list(stems), n=1, cutoff=0.6)
+        if close:
+            return stems[close[0]]
+        return self._find_doc_in_text(name)
+
+    def _find_doc_in_text(self, text: str) -> dict | None:
+        """Busca qué documento se menciona dentro de una frase completa."""
+        tnorm = _norm(text)
+        tokens = [w for w in re.split(r"[^a-z0-9]+", tnorm) if len(w) >= 4]
+        best, best_score = None, 0
+        for d in self.registry.all():
+            stem = _norm(Path(d["filename"]).stem)
+            if stem and stem in tnorm:
+                return d
+            score = sum(len(w) for w in tokens if w in stem)
+            if score > best_score:
+                best, best_score = d, score
+        return best if best_score >= 4 else None
+
+    def _open_doc(self, doc: dict) -> bool:
+        """Abre el documento con la aplicación predeterminada del sistema."""
+        path = doc.get("path") or ""
+        if not path or not Path(path).exists():
+            self.statusBar().showMessage(
+                f"El archivo de «{doc['filename']}» ya no está en su ruta original: {path}", 7000
+            )
+            return False
+        from PyQt6.QtGui import QDesktopServices
+        from PyQt6.QtCore import QUrl
+        QDesktopServices.openUrl(QUrl.fromLocalFile(path))
+        return True
+
+    def _apply_agent_actions(self, answer: str, question: str = "") -> str:
+        """Ejecuta las etiquetas de agente de la respuesta ([ADD_TASK: …],
+        [ADD_NOTE: Título :: contenido], [OPEN_DOC: …]) y las elimina del texto."""
+        done: list[str] = []
+
+        for m in re.finditer(r"\[ADD_TASK:\s*(.+?)\]", answer):
+            text = m.group(1).strip()
+            if text:
+                task = self.workspace.add_task(text, source="ia")
+                self.spaces_view.add_task_card(task["id"])
+                done.append(f"tarea «{text[:40]}»")
+
+        for m in re.finditer(r"\[ADD_NOTE:\s*(.+?)\s*::\s*(.+?)\]", answer, re.S):
+            title = m.group(1).strip()
+            content = m.group(2).strip()
+            if title:
+                note = self.workspace.add_note(title, content, source="ia")
+                self.spaces_view.add_note_card(note["id"])
+                done.append(f"nota «{title[:40]}»")
+
+        opened = False
+        m = _OPEN_TAG_RE.search(answer)
+        if m:
+            filename = m.group(1)
+            doc = self._find_doc(filename)
+            if doc:
+                if self._open_doc(doc):
+                    opened = True
+                    done.append(f"abierto «{doc['filename']}»")
+            else:
+                self.statusBar().showMessage(
+                    f"No se pudo encontrar el archivo: {filename}", 4000
+                )
+
+        # Respaldo: aunque el modelo olvide la etiqueta, si el usuario pidió
+        # abrir un documento lo detectamos e intentamos abrirlo igualmente.
+        qn = _norm(question)  # sin acentos: «ábreme» → «abreme»
+        if (not opened and qn
+                and _OPEN_INTENT_RE.search(qn)
+                and _OPEN_OBJECT_RE.search(qn)):
+            doc = self._find_doc_in_text(question)
+            if doc and self._open_doc(doc):
+                done.append(f"abierto «{doc['filename']}»")
+
+        answer = _OPEN_TAG_RE.sub("", answer)
+        answer = re.sub(
+            r"\[\s*(ADD_TASK|ADD_NOTE)\s*:.*?\]", "", answer,
+            flags=re.S | re.I,
+        ).strip()
+        if done:
+            self.statusBar().showMessage(
+                "✅ Agente: " + ", ".join(done) + " (mira en Espacios)", 8000
+            )
+        return answer
+
     def _on_query_error(self, message: str):
+        self._freeze_thinking()
         partial = "".join(self._current_answer)
         content = f"{partial}\n\n⚠ {message}" if partial.strip() else f"⚠ {message}"
         if self._messages and self._messages[-1]["role"] == "assistant":
             self._messages[-1]["content"] = content
+            self._messages[-1].pop("thinking", None)
         else:
             self._messages.append({"role": "assistant", "content": content, "sources": []})
         self._save_current_chat()
         self._render_chat()
 
     def _on_query_finished(self):
+        self._stream_timer.stop()
+        self._freeze_thinking()
+        if self._messages and self._messages[-1]["role"] == "assistant":
+            self._messages[-1].pop("thinking", None)
+            if not self._messages[-1]["content"].strip():
+                self._messages[-1]["content"] = "*(respuesta detenida)*"
         self._render_chat()
+        self.send_btn.setIcon(icon("send", "#0b0c0f", 16))
+        self.send_btn.setToolTip("Enviar (Enter)")
         self.send_btn.setEnabled(True)
         self.input.setEnabled(True)
+        self._update_context_gauge()
         self.statusBar().showMessage("Listo", 3000)
         self.query_worker = None
         self.input.setFocus()
@@ -1604,6 +2205,14 @@ class MainWindow(QMainWindow):
             self.cfg.update(dlg.values())
             config.save_config(self.cfg)
             self._update_backend_label()
+            # Aplicar tema y apariencia (estilo, letra, acento…) al instante.
+            apply_theme(QApplication.instance(), self.cfg.get("theme", "dark"))
+            self._apply_chat_style()
+            self._update_context_gauge()
+            if self._messages:
+                self._render_chat()
+            else:
+                self._welcome()
             self.statusBar().showMessage("Configuración guardada", 3000)
             if self.cfg.get("backend") == "ollama":
                 self._setup_ollama()

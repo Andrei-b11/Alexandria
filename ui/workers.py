@@ -87,6 +87,10 @@ class IngestWorker(QThread):
         self.finished_all.emit()
 
 
+class CancelledError(Exception):
+    """El usuario detuvo la generación."""
+
+
 class QueryWorker(QThread):
     """Recupera contexto y transmite la respuesta de la IA token a token."""
 
@@ -94,20 +98,34 @@ class QueryWorker(QThread):
     sources_ready = pyqtSignal(list)
     error = pyqtSignal(str)
     finished_answer = pyqtSignal()
+    cancelled = False  # poner a True para detener la generación en curso
 
-    def __init__(self, rag_engine, question, doc_ids=None, space_context=None):
+    def __init__(self, rag_engine, question, doc_ids=None, space_context=None,
+                 direct=False):
         super().__init__()
         self.rag = rag_engine
         self.question = question
         self.doc_ids = doc_ids
         self.space_context = space_context
+        self.direct = direct  # modo chat directo: sin RAG ni agente
+
+    def _emit_token(self, t: str):
+        if self.cancelled:
+            raise CancelledError()
+        self.token.emit(t)
 
     def run(self):
         try:
-            sources = self.rag.answer(
-                self.question, lambda t: self.token.emit(t), doc_ids=self.doc_ids, space_context=self.space_context
-            )
+            if self.direct:
+                sources = self.rag.chat_direct(self.question, self._emit_token)
+            else:
+                sources = self.rag.answer(
+                    self.question, self._emit_token,
+                    doc_ids=self.doc_ids, space_context=self.space_context,
+                )
             self.sources_ready.emit(sources)
+        except CancelledError:
+            self.sources_ready.emit([])  # respuesta parcial, sin fuentes
         except Exception as e:  # noqa: BLE001
             self.error.emit(str(e))
         finally:
